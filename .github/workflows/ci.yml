@@ -30,11 +30,23 @@ jobs:
         run: go vet ./...
 
       - name: Run unit tests
-        run: go test ./internal/service/... -v -timeout 60s
+        run: go test ./internal/service/... -v -cover -timeout 60s
+
+      - name: Run integration tests
+        run: go test ./internal/delivery/... -v -timeout 60s
+
+      - name: Generate coverage report
+        run: go test ./internal/... -coverprofile=coverage.out -timeout 60s
+
+      - name: Check coverage threshold (70%)
+        run: |
+          COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | tr -d '%')
+          echo "Total coverage: ${COVERAGE}%"
+          awk "BEGIN { if ($COVERAGE < 70) { print \"Coverage ${COVERAGE}% is below 70% threshold\"; exit 1 } }"
 
       - name: Upload test results
         if: always()
-        run: go test ./internal/service/... -json -timeout 60s > test-results.json || true
+        run: go test ./internal/... -json -timeout 60s > test-results.json || true
 
       - name: Upload test report artifact
         uses: actions/upload-artifact@v4
@@ -42,3 +54,10 @@ jobs:
         with:
           name: test-results
           path: test-results.json
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage.out

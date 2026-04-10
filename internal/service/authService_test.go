@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -244,4 +246,147 @@ func TestValidateToken_WrongSecret(t *testing.T) {
 
 	assert.Error(t, err)
 	assert.Nil(t, claims)
+}
+
+// --- Edge case & new tests for Midterm ---
+
+func TestLogin_EmptyEmail(t *testing.T) {
+	mockRepo := new(MockUserRepository)
+	svc := newTestAuthService(mockRepo)
+	ctx := context.Background()
+
+	mockRepo.On("GetByEmail", ctx, "").Return(nil, domain.ErrNotFound)
+
+	req := &domain.LoginRequest{Email: "", Password: "password123"}
+	token, err := svc.Login(ctx, req)
+
+	assert.Error(t, err)
+	assert.Equal(t, domain.ErrInvalidCredentials, err)
+	assert.Nil(t, token)
+	mockRepo.AssertExpectations(t)
+}
+
+func TestRegister_EmptyPassword(t *testing.T) {
+	mockRepo := new(MockUserRepository)
+	svc := newTestAuthService(mockRepo)
+	ctx := context.Background()
+
+	// Empty password hash — bcrypt should still create a token, but
+	// the service itself does not validate password strength (that is done in DTO layer).
+	// We test that if Create fails, Register propagates the error.
+	mockRepo.On("GetByEmail", ctx, "edge@example.com").Return(nil, domain.ErrNotFound)
+	mockRepo.On("Create", ctx, mock.AnythingOfType("*domain.User")).Return(fmt.Errorf("password hash required"))
+
+	user := &domain.User{Email: "edge@example.com", PasswordHash: ""}
+	token, err := svc.Register(ctx, user)
+
+	assert.Error(t, err)
+	assert.Nil(t, token)
+	mockRepo.AssertExpectations(t)
+}
+
+func TestValidateToken_Expired(t *testing.T) {
+	mockRepo := new(MockUserRepository)
+	svc := newTestAuthService(mockRepo)
+
+	// Generate a token with -1 second duration (already expired)
+	cfg := testConfig()
+	cfg.JWT.AccessTokenDuration = "-1s"
+	expiredSvc, err := NewAuthService(mockRepo, cfg)
+	assert.NoError(t, err)
+
+	ctx := context.Background()
+	mockRepo.On("GetByEmail", ctx, "expired@example.com").Return(nil, domain.ErrNotFound)
+	mockRepo.On("Create", ctx, mock.AnythingOfType("*domain.User")).Return(nil)
+
+	user := &domain.User{Email: "expired@example.com"}
+	token, err := expiredSvc.Register(ctx, user)
+	assert.NoError(t, err)
+
+	// Now validate the already-expired access token using the normal service
+	claims, err := svc.ValidateToken(token.AccessToken)
+
+	assert.Error(t, err)
+	assert.Nil(t, claims)
+}
+
+func TestRefreshToken_Success(t *testing.T) {
+	mockRepo := new(MockUserRepository)
+	svc := newTestAuthService(mockRepo)
+	ctx := context.Background()
+
+	// Register to get tokens
+	mockRepo.On("GetByEmail", ctx, "refresh@example.com").Return(nil, domain.ErrNotFound)
+	mockRepo.On("Create", ctx, mock.AnythingOfType("*domain.User")).Return(nil)
+
+	user := &domain.User{ID: 10, Email: "refresh@example.com"}
+	token, err := svc.Register(ctx, user)
+	assert.NoError(t, err)
+
+	// Refresh: service validates refresh token, then calls GetByID
+	activeUser := &domain.User{ID: 10, Email: "refresh@example.com", Status: "active"}
+	mockRepo.On("GetByID", ctx, 10).Return(activeUser, nil)
+
+	newToken, err := svc.RefreshToken(ctx, token.RefreshToken)
+
+	assert.NoError(t, err)
+	assert.NotNil(t, newToken)
+	assert.NotEmpty(t, newToken.AccessToken)
+	mockRepo.AssertExpectations(t)
+}
+
+func TestRefreshToken_InvalidToken(t *testing.T) {
+	mockRepo := new(MockUserRepository)
+	svc := newTestAuthService(mockRepo)
+	ctx := context.Background()
+
+	newToken, err := svc.RefreshToken(ctx, "this.is.invalid.refresh.token")
+
+	assert.Error(t, err)
+	assert.Nil(t, newToken)
+}
+
+func TestRegister_Concurrent(t *testing.T) {
+	// Concurrency test: 10 goroutines try to register the same email simultaneously.
+	// Goroutine 0 sees slot free and succeeds; goroutines 1-9 see existing user and get ErrAlreadyExists.
+	const goroutines = 10
+	results := make([]error, goroutines)
+	var wg sync.WaitGroup
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			mockRepo := new(MockUserRepository)
+			svc := newTestAuthService(mockRepo)
+			ctx := context.Background()
+
+			if idx == 0 {
+				mockRepo.On("GetByEmail", ctx, "concurrent@example.com").Return(nil, domain.ErrNotFound)
+				mockRepo.On("Create", ctx, mock.AnythingOfType("*domain.User")).Return(nil)
+			} else {
+				existing := &domain.User{ID: idx, Email: "concurrent@example.com", Status: "active"}
+				mockRepo.On("GetByEmail", ctx, "concurrent@example.com").Return(existing, nil)
+			}
+
+			user := &domain.User{Email: "concurrent@example.com", PasswordHash: "hash"}
+			_, err := svc.Register(ctx, user)
+			results[idx] = err
+		}(i)
+	}
+
+	wg.Wait()
+
+	successCount := 0
+	duplicateCount := 0
+	for _, err := range results {
+		if err == nil {
+			successCount++
+		} else if err == domain.ErrAlreadyExists {
+			duplicateCount++
+		}
+	}
+
+	assert.Equal(t, 1, successCount)
+	assert.Equal(t, goroutines-1, duplicateCount)
 }

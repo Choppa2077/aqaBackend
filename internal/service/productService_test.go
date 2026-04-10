@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -317,4 +318,140 @@ func TestListProducts_WithFilter(t *testing.T) {
 	assert.Equal(t, int64(2), total)
 	assert.Len(t, products, 2)
 	mockRepo.AssertExpectations(t)
+}
+
+// --- Edge cases & new tests for Midterm ---
+
+func TestUpdateStock_Success(t *testing.T) {
+	mockRepo := new(MockProductRepository)
+	svc := NewProductService(mockRepo)
+	ctx := context.Background()
+
+	existing := &domain.Product{ID: 1, Name: "Laptop", Price: 999.99, Stock: 10}
+	updated := &domain.Product{ID: 1, Name: "Laptop", Price: 999.99, Stock: 15}
+
+	mockRepo.On("GetByID", ctx, 1).Return(existing, nil)
+	mockRepo.On("Update", ctx, updated).Return(nil)
+
+	err := svc.UpdateStock(ctx, 1, 5) // add 5 units
+
+	assert.NoError(t, err)
+	mockRepo.AssertExpectations(t)
+}
+
+func TestUpdateStock_ProductNotFound(t *testing.T) {
+	mockRepo := new(MockProductRepository)
+	svc := NewProductService(mockRepo)
+	ctx := context.Background()
+
+	mockRepo.On("GetByID", ctx, 999).Return(nil, domain.ErrNotFound)
+
+	err := svc.UpdateStock(ctx, 999, 5)
+
+	assert.Error(t, err)
+	assert.Equal(t, domain.ErrNotFound, err)
+	mockRepo.AssertExpectations(t)
+}
+
+func TestCheckStock_Sufficient(t *testing.T) {
+	mockRepo := new(MockProductRepository)
+	svc := NewProductService(mockRepo)
+	ctx := context.Background()
+
+	product := &domain.Product{ID: 1, Name: "Phone", Price: 499.99, Stock: 20}
+	mockRepo.On("GetByID", ctx, 1).Return(product, nil)
+
+	ok, err := svc.CheckStock(ctx, 1, 10)
+
+	assert.NoError(t, err)
+	assert.True(t, ok)
+	mockRepo.AssertExpectations(t)
+}
+
+func TestCheckStock_Insufficient(t *testing.T) {
+	mockRepo := new(MockProductRepository)
+	svc := NewProductService(mockRepo)
+	ctx := context.Background()
+
+	product := &domain.Product{ID: 1, Name: "Phone", Price: 499.99, Stock: 3}
+	mockRepo.On("GetByID", ctx, 1).Return(product, nil)
+
+	ok, err := svc.CheckStock(ctx, 1, 10)
+
+	assert.NoError(t, err)
+	assert.False(t, ok)
+	mockRepo.AssertExpectations(t)
+}
+
+func TestCreateProduct_VeryLongName(t *testing.T) {
+	mockRepo := new(MockProductRepository)
+	svc := NewProductService(mockRepo)
+	ctx := context.Background()
+
+	// Name with 300 characters — service does not enforce max length,
+	// so this should pass validation and reach repo.Create.
+	longName := ""
+	for i := 0; i < 300; i++ {
+		longName += "a"
+	}
+	catID := 1
+	product := &domain.Product{
+		Name:       longName,
+		Price:      9.99,
+		CategoryID: &catID,
+	}
+
+	mockRepo.On("GetCategoryByID", ctx, 1).Return(&domain.Category{ID: 1, Name: "Electronics"}, nil)
+	mockRepo.On("Create", ctx, product).Return(nil)
+
+	err := svc.CreateProduct(ctx, product)
+
+	assert.NoError(t, err)
+	mockRepo.AssertExpectations(t)
+}
+
+func TestPurchaseProduct_Concurrent(t *testing.T) {
+	// Concurrency edge case: 5 goroutines attempt to purchase the last item in stock.
+	// Each goroutine uses its own isolated mock (simulating separate DB transactions).
+	// Goroutine 0 sees stock=1 and succeeds; goroutines 1-4 see stock=0 and fail.
+	const buyers = 5
+	results := make([]error, buyers)
+	var wg sync.WaitGroup
+
+	for i := 0; i < buyers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			interRepo := new(MockInteractionRepository)
+			prodRepo := new(MockProductRepository)
+			svc := NewInteractionService(interRepo, prodRepo)
+			ctx := context.Background()
+
+			if idx == 0 {
+				// First buyer gets the last unit
+				product := &domain.Product{ID: 1, Price: 99.99, Stock: 1}
+				updated := &domain.Product{ID: 1, Price: 99.99, Stock: 0}
+				prodRepo.On("GetByID", ctx, 1).Return(product, nil)
+				interRepo.On("RecordPurchase", ctx, 0, 1, 1, 99.99).Return(nil)
+				prodRepo.On("Update", ctx, updated).Return(nil)
+			} else {
+				// Remaining buyers see empty stock
+				product := &domain.Product{ID: 1, Price: 99.99, Stock: 0}
+				prodRepo.On("GetByID", ctx, 1).Return(product, nil)
+			}
+
+			results[idx] = svc.PurchaseProduct(ctx, idx, 1, 1)
+		}(i)
+	}
+
+	wg.Wait()
+
+	successCount := 0
+	for _, err := range results {
+		if err == nil {
+			successCount++
+		}
+	}
+
+	assert.Equal(t, 1, successCount, "only one buyer should succeed when stock=1")
 }

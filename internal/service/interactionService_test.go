@@ -298,3 +298,49 @@ func TestIsProductLiked_False(t *testing.T) {
 	assert.False(t, liked)
 	interRepo.AssertExpectations(t)
 }
+
+// --- New tests for Midterm ---
+
+func TestUnlikeProduct_Success(t *testing.T) {
+	interRepo := new(MockInteractionRepository)
+	prodRepo := new(MockProductRepository)
+	svc := newTestInteractionService(interRepo, prodRepo)
+	ctx := context.Background()
+
+	interRepo.On("RemoveLike", ctx, 5, 1).Return(nil)
+
+	err := svc.UnlikeProduct(ctx, 5, 1)
+
+	assert.NoError(t, err)
+	interRepo.AssertExpectations(t)
+}
+
+func TestHasPurchasedProduct_True(t *testing.T) {
+	interRepo := new(MockInteractionRepository)
+	prodRepo := new(MockProductRepository)
+	svc := newTestInteractionService(interRepo, prodRepo)
+	ctx := context.Background()
+
+	interRepo.On("HasPurchased", ctx, 5, 1).Return(true, nil)
+
+	purchased, err := svc.HasPurchasedProduct(ctx, 5, 1)
+
+	assert.NoError(t, err)
+	assert.True(t, purchased)
+	interRepo.AssertExpectations(t)
+}
+
+func TestHasPurchasedProduct_False(t *testing.T) {
+	interRepo := new(MockInteractionRepository)
+	prodRepo := new(MockProductRepository)
+	svc := newTestInteractionService(interRepo, prodRepo)
+	ctx := context.Background()
+
+	interRepo.On("HasPurchased", ctx, 5, 99).Return(false, nil)
+
+	purchased, err := svc.HasPurchasedProduct(ctx, 5, 99)
+
+	assert.NoError(t, err)
+	assert.False(t, purchased)
+	interRepo.AssertExpectations(t)
+}
